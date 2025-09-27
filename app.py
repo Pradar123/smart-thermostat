@@ -526,7 +526,7 @@ def parse_args():
     ap = argparse.ArgumentParser(description="Zónás, textfájl-alapú, öntanuló termosztátváz (Home Assistant / Node-RED)")
     ap.add_argument("--rooms", type=int, default=DEFAULT_NUM_ROOMS, help="Szobák száma (room1..roomN)")
     ap.add_argument("--loop-seconds", type=float, default=DEFAULT_LOOP_SECONDS, help="Vezérlési ciklus másodpercben")
-    ap.add_argument("--base-dir", type=str, default=os.getcwd(), help="Projekt gyökér mappa (alapértelmezés: aktuális könyvtár)")
+    ap.add_argument("--base-dir", type=str, default="I:\\thermostat", help="Projekt gyökér mappa (alapértelmezés: aktuális könyvtár)")
     return ap.parse_args()
 
 def main():

@@ -574,5 +574,5 @@ class SupervisorApp(tk.Tk):
 # -------------------- Belépési pont --------------------
 
 if __name__ == "__main__":
-    app = SupervisorApp(base_dir=os.getcwd())
+    app = SupervisorApp(base_dir="I:\\thermostat")
     app.mainloop()
