@@ -1,21 +1,10 @@
 # thermostat_supervisor_gui.py
 # Egyoldalas Windows GUI a textfájlos, zónás termosztáthoz.
 # - Nem indítja a controllert: a fájlokon keresztül felügyel, állít és figyel.
-# - Minden lényeges beállítás: num_rooms, global_hysteresis, min_on/off, tau_minutes, loop_seconds,
-#   per-szoba: enabled, név, setpoint, (opcionális) hysteresis; külső: outdoor_temperature, mode.
-# - Élő státusz: temp, humidity, heating_command, predicted_overshoot, last_switch; automatikus frissítés.
-# - Görgethető szobalista, atomi fájlírások, failsafe fájl-/mappagenerálás.
+# - Stabil I/O: retry-olt olvasás/írás Samba/Windows lockok ellen.
+# - Szép naplózás (logs/gui.log) rotációval; hibatűrő frissítés (nem omlik össze).
 #
 # Futtatás: python thermostat_supervisor_gui.py
-#
-# Megjegyzés:
-# - A GUI a következő struktúrát feltételezi / hozza létre:
-#   ./config/controller_config.json
-#   ./config/rooms.json
-#   ./config/learning.json
-#   ./data/external/{outdoor_temperature.txt, mode.txt}
-#   ./data/rooms/roomX/{sensor_temperature.txt, sensor_humidity.txt, setpoint.txt, hysteresis.txt, command_heat.txt, status.json}
-#   ./data/logs/events.log
 
 import os
 import json
@@ -36,36 +25,69 @@ DEFAULT_MIN_ON_SECONDS = 120
 DEFAULT_MIN_OFF_SECONDS = 120
 DEFAULT_TAU_MIN = 5.0
 
+# Windows hálózati meghajtó alap (állítsd igény szerint)
+DEFAULT_BASE_DIR = r"I:\thermostat"
+
 OUTDOOR_BINS = [(-30, -10), (-10, 0), (0, 10), (10, 20), (20, 35), (35, 60)]
 
-# -------------------- Segédfüggvények: IO, pathok, atomi írások --------------------
+# I/O retry beállítások (Samba/Windows lockok ellen)
+IO_RETRIES = 5
+IO_DELAY_S = 0.2
+
+# Log rotáció
+MAX_LOG_BYTES = 2 * 1024 * 1024  # ~2MB
+
+# -------------------- Segédfüggvények: idő, retry-os I/O --------------------
 
 def ensure_dir(path: str):
     os.makedirs(path, exist_ok=True)
 
+def iso_now() -> str:
+    return datetime.now().isoformat(timespec="seconds")
+
+def _retry_io(fn, *args, **kwargs):
+    last_exc = None
+    for attempt in range(IO_RETRIES):
+        try:
+            return fn(*args, **kwargs)
+        except Exception as e:
+            last_exc = e
+            if attempt < IO_RETRIES - 1:
+                time.sleep(IO_DELAY_S)
+            else:
+                raise last_exc
+
 def atomic_write_text(path: str, content: str):
     tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        f.write(content)
-    os.replace(tmp, path)
+    def _write_and_replace():
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(content)
+        os.replace(tmp, path)
+    _retry_io(_write_and_replace)
 
 def load_json(path: str, default: Any) -> Any:
     try:
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
+        def _load():
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        return _retry_io(_load)
     except Exception:
         return default
 
 def save_json_atomic(path: str, obj: Any):
     tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(obj, f, indent=2, ensure_ascii=False)
-    os.replace(tmp, path)
+    def _dump_and_replace():
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(obj, f, indent=2, ensure_ascii=False)
+        os.replace(tmp, path)
+    _retry_io(_dump_and_replace)
 
 def safe_read_text(path: str) -> Optional[str]:
     try:
-        with open(path, "r", encoding="utf-8") as f:
-            return f.read().strip()
+        def _read():
+            with open(path, "r", encoding="utf-8") as f:
+                return f.read().strip()
+        return _retry_io(_read)
     except Exception:
         return None
 
@@ -78,13 +100,48 @@ def safe_read_float(path: str, default: float) -> float:
     except Exception:
         return default
 
-def iso_now() -> str:
-    return datetime.now().isoformat(timespec="seconds")
+# -------------------- Logger --------------------
+
+class EventLogger:
+    def __init__(self, log_path: str):
+        self.log_path = log_path
+        ensure_dir(os.path.dirname(log_path))
+        self.lock = threading.Lock()
+
+    def _rotate_if_needed(self):
+        try:
+            if os.path.exists(self.log_path) and os.path.getsize(self.log_path) > MAX_LOG_BYTES:
+                bak = self.log_path + ".1"
+                try:
+                    if os.path.exists(bak):
+                        os.remove(bak)
+                except Exception:
+                    pass
+                try:
+                    os.replace(self.log_path, bak)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    def log(self, msg: str):
+        line = f"{iso_now()} | {msg}\n"
+        try:
+            with self.lock:
+                self._rotate_if_needed()
+                with open(self.log_path, "a", encoding="utf-8") as f:
+                    f.write(line)
+        except Exception:
+            try:
+                # végső fallback: konzol
+                print(line, end="")
+            except Exception:
+                pass
 
 # -------------------- Fájlrendszer wrapper (gyökér köré) --------------------
 
 class FS:
-    def __init__(self, base_dir: str):
+    def __init__(self, base_dir: str, logger: Optional[EventLogger] = None):
         self.base_dir = base_dir
         self.config_dir = os.path.join(base_dir, "config")
         self.data_dir = os.path.join(base_dir, "data")
@@ -104,7 +161,10 @@ class FS:
         self.p_outdoor_temp = os.path.join(self.external_dir, "outdoor_temperature.txt")
         self.p_mode = os.path.join(self.external_dir, "mode.txt")
         self.p_status_all = os.path.join(self.data_dir, "status_all.json")
-        self.p_log = os.path.join(self.logs_dir, "events.log")
+        self.p_log = os.path.join(self.logs_dir, "events.log")  # controller logja
+        self.p_gui_log = os.path.join(self.logs_dir, "gui.log") # GUI log
+
+        self.logger = logger or EventLogger(self.p_gui_log)
 
         # failsafe alapok
         self._ensure_controller_cfg()
@@ -133,6 +193,7 @@ class FS:
                 "tau_minutes": DEFAULT_TAU_MIN
             }
             save_json_atomic(self.p_controller_cfg, cfg)
+            self.logger.log("controller_config.json létrehozva alapértékekkel.")
 
     def _ensure_rooms_map(self):
         m = load_json(self.p_rooms_map, None)
@@ -141,6 +202,7 @@ class FS:
                      for i in range(1, DEFAULT_NUM_ROOMS + 1)]
             m = {"rooms": rooms}
             save_json_atomic(self.p_rooms_map, m)
+            self.logger.log("rooms.json létrehozva alap szobákkal.")
 
     def ensure_rooms_exist(self, num_rooms: int):
         # egészítsük ki a rooms.json-t és a per-szoba fájlokat
@@ -171,7 +233,8 @@ class FS:
                 save_json_atomic(pstat, {"init": True, "room_id": rid, "name": f"Szoba {i}"})
         if changed:
             save_json_atomic(self.p_rooms_map, m)
-        # controller_config.json-ban is állítsuk be a num_rooms-ot (loop_seconds-t nem piszkáljuk)
+            self.logger.log(f"rooms.json bővítve {num_rooms} szobára.")
+        # controller_config.json-ban is állítsuk be a num_rooms-ot
         cfg = load_json(self.p_controller_cfg, {})
         cfg["num_rooms"] = int(num_rooms)
         save_json_atomic(self.p_controller_cfg, cfg)
@@ -200,7 +263,6 @@ class RoomRow(ttk.Frame):
         self.hyst_var = tk.StringVar(value=safe_read_text(hyst_path) or f"{DEFAULT_HYSTERESIS:.2f}")
 
         # UI: rács, kompakt táblázatsor
-        # Oszlopok: ID | Név | Enabled | T(°C) | RH(%) | Setpoint | Hyst | Cmd | Overshoot | Last switch | Mentés | Megnyit
         col = 0
         ttk.Label(self, text=self.room_id, width=8).grid(row=0, column=col, padx=4, pady=3, sticky="w"); col += 1
 
@@ -216,7 +278,6 @@ class RoomRow(ttk.Frame):
         self.hyst_entry = ttk.Entry(self, textvariable=self.hyst_var, width=8)
         self.hyst_entry.grid(row=0, column=col, padx=4, pady=3); col += 1
 
-        # fűtés állapot (színes pötty + felirat)
         self.cmd_label = ttk.Label(self, textvariable=self.cmd_var, width=8)
         self.cmd_label.grid(row=0, column=col, padx=4, pady=3); col += 1
 
@@ -240,8 +301,7 @@ class RoomRow(ttk.Frame):
             messagebox.showerror("Hiba", f"Nem sikerült megnyitni: {rdir}")
 
     def update_status_colors(self):
-        # egyszerű vizuális jelzés: ON= zöld, OFF= szürke
-        txt = self.cmd_var.get().upper()
+        txt = (self.cmd_var.get() or "").upper()
         fg = "#2e7d32" if txt == "ON" else "#555555"
         try:
             self.cmd_label.configure(foreground=fg)
@@ -250,79 +310,90 @@ class RoomRow(ttk.Frame):
 
     def refresh_from_files(self):
         # status.json preferált, fallback a nyers txt-kre
-        pstat = os.path.join(self.fs.rooms_root, self.room_id, "status.json")
-        st = load_json(pstat, None)
-        if st:
-            t = st.get("temperature")
-            h = st.get("humidity")
-            cmd = st.get("heating_command")
-            po = st.get("predicted_overshoot")
-            ls = st.get("last_switch_iso")
-            if isinstance(t, (int, float)):
+        try:
+            pstat = os.path.join(self.fs.rooms_root, self.room_id, "status.json")
+            st = load_json(pstat, None)
+            if st:
+                t = st.get("temperature")
+                h = st.get("humidity")
+                cmd = st.get("heating_command")
+                po = st.get("predicted_overshoot")
+                ls = st.get("last_switch_iso")
+                if isinstance(t, (int, float)):
+                    self.temp_var.set(f"{t:.2f}°")
+                else:
+                    self.temp_var.set("—")
+                if isinstance(h, (int, float)):
+                    self.hum_var.set(f"{h:.0f}%")
+                else:
+                    self.hum_var.set("—")
+                self.cmd_var.set("ON" if int(cmd or 0) == 1 else "OFF")
+                self.overshoot_var.set("—" if po is None else f"{float(po):.2f}°")
+                self.last_switch_var.set(ls or "—")
+            else:
+                # fallback
+                pt = os.path.join(self.fs.rooms_root, self.room_id, "sensor_temperature.txt")
+                ph = os.path.join(self.fs.rooms_root, self.room_id, "sensor_humidity.txt")
+                cmdp = os.path.join(self.fs.rooms_root, self.room_id, "command_heat.txt")
+                t = safe_read_float(pt, DEFAULT_SETPOINT)
+                h = safe_read_float(ph, 50.0)
+                c = safe_read_text(cmdp)
                 self.temp_var.set(f"{t:.2f}°")
-            else:
-                self.temp_var.set("—")
-            if isinstance(h, (int, float)):
                 self.hum_var.set(f"{h:.0f}%")
-            else:
-                self.hum_var.set("—")
-            self.cmd_var.set("ON" if int(cmd or 0) == 1 else "OFF")
-            self.overshoot_var.set("—" if po is None else f"{float(po):.2f}°")
-            self.last_switch_var.set(ls or "—")
-        else:
-            # fallback
-            pt = os.path.join(self.fs.rooms_root, self.room_id, "sensor_temperature.txt")
-            ph = os.path.join(self.fs.rooms_root, self.room_id, "sensor_humidity.txt")
-            cmdp = os.path.join(self.fs.rooms_root, self.room_id, "command_heat.txt")
-            t = safe_read_float(pt, DEFAULT_SETPOINT)
-            h = safe_read_float(ph, 50.0)
-            c = safe_read_text(cmdp)
-            self.temp_var.set(f"{t:.2f}°")
-            self.hum_var.set(f"{h:.0f}%")
-            self.cmd_var.set("ON" if (c or "0").strip() == "1" else "OFF")
-            self.overshoot_var.set("—")
-            self.last_switch_var.set("—")
+                self.cmd_var.set("ON" if (c or "0").strip() == "1" else "OFF")
+                self.overshoot_var.set("—")
+                self.last_switch_var.set("—")
 
-        # setpoint/hyst UI frissítés (ha más írta közben)
-        sp_path = os.path.join(self.fs.rooms_root, self.room_id, "setpoint.txt")
-        hy_path = os.path.join(self.fs.rooms_root, self.room_id, "hysteresis.txt")
-        sp_now = safe_read_text(sp_path)
-        hy_now = safe_read_text(hy_path)
-        if sp_now and self.setpoint_var.get() != sp_now:
-            self.setpoint_var.set(sp_now)
-        if hy_now and self.hyst_var.get() != hy_now:
-            self.hyst_var.set(hy_now)
+            # setpoint/hyst UI frissítés (ha más írta közben)
+            sp_path = os.path.join(self.fs.rooms_root, self.room_id, "setpoint.txt")
+            hy_path = os.path.join(self.fs.rooms_root, self.room_id, "hysteresis.txt")
+            sp_now = safe_read_text(sp_path)
+            hy_now = safe_read_text(hy_path)
+            if sp_now and self.setpoint_var.get() != sp_now:
+                self.setpoint_var.set(sp_now)
+            if hy_now and self.hyst_var.get() != hy_now:
+                self.hyst_var.set(hy_now)
 
-        self.update_status_colors()
+            self.update_status_colors()
+        except Exception as e:
+            # nem állunk le
+            self.fs.logger.log(f"{self.room_id}: refresh error: {e}")
 
     def save_changes(self):
         # név + enabled -> rooms.json
-        rooms = load_json(self.fs.p_rooms_map, {"rooms": []})
-        changed = False
-        for r in rooms.get("rooms", []):
-            if r.get("id") == self.room_id:
-                new_name = self.name_var.get().strip() or self.room_id
-                new_enabled = bool(self.enabled_var.get())
-                if r.get("name") != new_name:
-                    r["name"] = new_name
-                    changed = True
-                if bool(r.get("enabled", True)) != new_enabled:
-                    r["enabled"] = new_enabled
-                    changed = True
-                break
-        if changed:
-            save_json_atomic(self.fs.p_rooms_map, rooms)
+        try:
+            rooms = load_json(self.fs.p_rooms_map, {"rooms": []})
+            changed = False
+            for r in rooms.get("rooms", []):
+                if r.get("id") == self.room_id:
+                    new_name = self.name_var.get().strip() or self.room_id
+                    new_enabled = bool(self.enabled_var.get())
+                    if r.get("name") != new_name:
+                        r["name"] = new_name
+                        changed = True
+                    if bool(r.get("enabled", True)) != new_enabled:
+                        r["enabled"] = new_enabled
+                        changed = True
+                    break
+            if changed:
+                save_json_atomic(self.fs.p_rooms_map, rooms)
+                self.fs.logger.log(f"{self.room_id}: rooms.json frissítve (name/enabled).")
+        except Exception as e:
+            self.fs.logger.log(f"{self.room_id}: rooms.json mentés hiba: {e}")
+            messagebox.showerror("Hiba", f"rooms.json mentése sikertelen:\n{e}")
 
         # setpoint / hysteresis txt
         try:
             sp = float(self.setpoint_var.get().replace(",", "."))
             atomic_write_text(os.path.join(self.fs.rooms_root, self.room_id, "setpoint.txt"), f"{sp:.2f}")
-        except Exception:
+        except Exception as e:
+            self.fs.logger.log(f"{self.room_id}: setpoint mentés hiba: {e}")
             messagebox.showwarning("Figyelem", f"{self.room_id}: Setpoint formátum hibás.")
         try:
             hy = float(self.hyst_var.get().replace(",", "."))
             atomic_write_text(os.path.join(self.fs.rooms_root, self.room_id, "hysteresis.txt"), f"{hy:.2f}")
-        except Exception:
+        except Exception as e:
+            self.fs.logger.log(f"{self.room_id}: hysteresis mentés hiba: {e}")
             messagebox.showwarning("Figyelem", f"{self.room_id}: Hysteresis formátum hibás.")
 
 # Egyszerű tooltip segéd
@@ -337,7 +408,10 @@ class CreateToolTip:
     def showtip(self, event=None):
         if self.tipwindow or not self.text:
             return
-        x, y, cx, cy = self.widget.bbox("insert") if self.widget.winfo_viewable() else (0, 0, 0, 0)
+        try:
+            x, y, cx, cy = self.widget.bbox("insert")
+        except Exception:
+            x = y = 0
         x = x + self.widget.winfo_rootx() + 20
         y = y + self.widget.winfo_rooty() + 20
         self.tipwindow = tw = tk.Toplevel(self.widget)
@@ -371,7 +445,11 @@ class SupervisorApp(tk.Tk):
         except Exception:
             pass
 
-        self.fs = FS(base_dir)
+        # Logger + FS
+        tmp_logger = EventLogger(os.path.join(base_dir, "data", "logs", "gui.log"))
+        self.fs = FS(base_dir, logger=tmp_logger)
+        self.logger = self.fs.logger
+
         self.refresh_interval_ms = 1000
 
         # Fejléc / útvonal
@@ -398,7 +476,6 @@ class SupervisorApp(tk.Tk):
         self.tau_var = tk.StringVar(value=str(cfg.get("tau_minutes", DEFAULT_TAU_MIN)))
 
         # elrendezés
-        # Sor1: rooms | loop | hyst
         row1 = ttk.Frame(globalf)
         row1.pack(fill=tk.X, pady=2)
         ttk.Label(row1, text="Szobák száma:").pack(side=tk.LEFT)
@@ -410,7 +487,6 @@ class SupervisorApp(tk.Tk):
         ttk.Label(row1, text="Globális hiszterézis (°C):").pack(side=tk.LEFT, padx=(18,0))
         ttk.Entry(row1, textvariable=self.hyst_global_var, width=8).pack(side=tk.LEFT, padx=6)
 
-        # Sor2: min on/off | tau
         row2 = ttk.Frame(globalf)
         row2.pack(fill=tk.X, pady=2)
         ttk.Label(row2, text="Min ON (s):").pack(side=tk.LEFT)
@@ -444,27 +520,22 @@ class SupervisorApp(tk.Tk):
         roomsf = ttk.LabelFrame(self, text="Szobák", padding=4)
         roomsf.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=8, pady=6)
 
-        # Fejléc sor
         header = ttk.Frame(roomsf)
         header.pack(fill=tk.X, padx=2)
         labels = ["ID", "Név", "Aktív", "T (°C)", "RH (%)", "Setpoint", "Hyster.", "Fűtés", "Overshoot", "Utolsó váltás", "", ""]
-        widths =  [8, 18, 6, 8, 8, 8, 8, 8, 10, 19, 6, 6]
+        widths =  [8,   18,    6,      8,       8,        8,         8,        8,         10,             19,                6,  6]
         for i, (t, w) in enumerate(zip(labels, widths)):
             ttk.Label(header, text=t, width=w).grid(row=0, column=i, padx=4, pady=2, sticky="w")
 
-        # Scrollable area
         self.canvas = tk.Canvas(roomsf, highlightthickness=0)
         self.scroll = ttk.Scrollbar(roomsf, orient="vertical", command=self.canvas.yview)
         self.inner = ttk.Frame(self.canvas)
-
         self.inner.bind("<Configure>", lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all")))
         self.canvas.create_window((0,0), window=self.inner, anchor="nw")
         self.canvas.configure(yscrollcommand=self.scroll.set)
-
         self.canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         self.scroll.pack(side=tk.RIGHT, fill=tk.Y)
 
-        # Szoba sorok felvétele
         self.room_rows: Dict[str, RoomRow] = {}
         self.rebuild_room_rows()
 
@@ -474,33 +545,51 @@ class SupervisorApp(tk.Tk):
         ttk.Button(bottom, text="Minden szobaváltoztatás mentése", command=self.save_all_rooms).pack(side=tk.RIGHT, padx=6)
         ttk.Button(bottom, text="Szobák frissítése a szám alapján", command=self.apply_num_rooms).pack(side=tk.RIGHT, padx=6)
 
+        # Status bar
+        self.status_var = tk.StringVar(value="Kész.")
+        status = ttk.Label(self, textvariable=self.status_var, anchor="w", padding=(8,4))
+        status.pack(side=tk.BOTTOM, fill=tk.X)
+
         # Periodikus státuszfrissítés
         self.after(self.refresh_interval_ms, self.periodic_refresh)
+
+        self.logger.log("GUI elindult.")
 
     # ---------- Akciók ----------
 
     def change_base(self):
-        newdir = filedialog.askdirectory(initialdir=self.fs.base_dir, title="Válassz projekt gyökeret")
-        if not newdir:
-            return
-        self.base_var.set(newdir)
-        self.fs = FS(newdir)
-        self.reload_all()
+        try:
+            newdir = filedialog.askdirectory(initialdir=self.fs.base_dir, title="Válassz projekt gyökeret")
+            if not newdir:
+                return
+            self.base_var.set(newdir)
+            self.fs = FS(newdir)  # új FS + saját logger a mappába
+            self.logger = self.fs.logger
+            self.reload_all()
+            self.logger.log(f"Base dir módosítva: {newdir}")
+        except Exception as e:
+            self.logger.log(f"change_base error: {e}")
+            messagebox.showerror("Hiba", f"Nem sikerült módosítani az elérési utat:\n{e}")
 
     def reload_all(self):
-        # betölt konfig, külső bemenetek, szobák
-        cfg = load_json(self.fs.p_controller_cfg, {})
-        self.num_rooms_var.set(int(cfg.get("num_rooms", DEFAULT_NUM_ROOMS)))
-        self.loop_var.set(str(cfg.get("loop_seconds", DEFAULT_LOOP_SECONDS)))
-        self.hyst_global_var.set(str(cfg.get("global_hysteresis", DEFAULT_HYSTERESIS)))
-        self.min_on_var.set(str(cfg.get("min_on_seconds", DEFAULT_MIN_ON_SECONDS)))
-        self.min_off_var.set(str(cfg.get("min_off_seconds", DEFAULT_MIN_OFF_SECONDS)))
-        self.tau_var.set(str(cfg.get("tau_minutes", DEFAULT_TAU_MIN)))
+        try:
+            cfg = load_json(self.fs.p_controller_cfg, {})
+            self.num_rooms_var.set(int(cfg.get("num_rooms", DEFAULT_NUM_ROOMS)))
+            self.loop_var.set(str(cfg.get("loop_seconds", DEFAULT_LOOP_SECONDS)))
+            self.hyst_global_var.set(str(cfg.get("global_hysteresis", DEFAULT_HYSTERESIS)))
+            self.min_on_var.set(str(cfg.get("min_on_seconds", DEFAULT_MIN_ON_SECONDS)))
+            self.min_off_var.set(str(cfg.get("min_off_seconds", DEFAULT_MIN_OFF_SECONDS)))
+            self.tau_var.set(str(cfg.get("tau_minutes", DEFAULT_TAU_MIN)))
 
-        self.mode_var.set((safe_read_text(self.fs.p_mode) or "auto").lower())
-        self.outdoor_var.set(safe_read_text(self.fs.p_outdoor_temp) or "10.0")
+            self.mode_var.set((safe_read_text(self.fs.p_mode) or "auto").lower())
+            self.outdoor_var.set(safe_read_text(self.fs.p_outdoor_temp) or "10.0")
 
-        self.rebuild_room_rows()
+            self.rebuild_room_rows()
+            self.status_var.set("Újratöltve.")
+            self.logger.log("GUI Reload kész.")
+        except Exception as e:
+            self.logger.log(f"reload_all error: {e}")
+            messagebox.showerror("Hiba", f"Reload sikertelen:\n{e}")
 
     def rebuild_room_rows(self):
         for child in self.inner.winfo_children():
@@ -514,9 +603,12 @@ class SupervisorApp(tk.Tk):
 
     def open_log(self):
         try:
-            os.startfile(self.fs.p_log)
+            os.startfile(self.fs.p_log)  # controller log
         except Exception:
-            messagebox.showinfo("Info", "Még nincs logfájl vagy nem megnyitható.")
+            try:
+                os.startfile(self.fs.p_gui_log)  # GUI log, ha a controller log még nincs
+            except Exception:
+                messagebox.showinfo("Info", "Még nincs logfájl vagy nem megnyitható.")
 
     def save_global_config(self):
         try:
@@ -528,51 +620,73 @@ class SupervisorApp(tk.Tk):
             cfg["min_off_seconds"] = float(str(self.min_off_var.get()).replace(",", "."))
             cfg["tau_minutes"] = float(str(self.tau_var.get()).replace(",", "."))
             save_json_atomic(self.fs.p_controller_cfg, cfg)
+            self.fs.ensure_rooms_exist(int(cfg["num_rooms"]))  # ha bővül, azonnal generáljuk a fájlokat
+            self.logger.log("Globális konfig mentve.")
             messagebox.showinfo("OK", "Globális konfig mentve.")
         except Exception as e:
+            self.logger.log(f"Konfig mentése hiba: {e}")
             messagebox.showerror("Hiba", f"Konfig mentése sikertelen:\n{e}")
 
     def save_external(self):
-        mode = self.mode_var.get().strip().lower()
-        if mode not in ("auto", "off"):
-            messagebox.showwarning("Figyelem", "Mód csak 'auto' vagy 'off' lehet.")
-            return
-        atomic_write_text(self.fs.p_mode, mode)
         try:
+            mode = self.mode_var.get().strip().lower()
+            if mode not in ("auto", "off"):
+                messagebox.showwarning("Figyelem", "Mód csak 'auto' vagy 'off' lehet.")
+                return
+            atomic_write_text(self.fs.p_mode, mode)
             out = float(self.outdoor_var.get().replace(",", "."))
             atomic_write_text(self.fs.p_outdoor_temp, f"{out:.2f}")
-        except Exception:
-            messagebox.showwarning("Figyelem", "Kültéri hőmérséklet formátum hibás.")
-            return
-        messagebox.showinfo("OK", "Bemenetek mentve.")
+            self.logger.log(f"Külső bemenetek mentve: mode={mode}, outdoor={out:.2f}")
+            messagebox.showinfo("OK", "Bemenetek mentve.")
+        except Exception as e:
+            self.logger.log(f"Bemenetek mentése hiba: {e}")
+            messagebox.showerror("Hiba", f"Bemenetek mentése sikertelen:\n{e}")
 
     def save_all_rooms(self):
+        err = 0
         for rr in self.room_rows.values():
-            rr.save_changes()
-        messagebox.showinfo("OK", "Minden szoba mentve.")
+            try:
+                rr.save_changes()
+            except Exception as e:
+                err += 1
+                self.logger.log(f"save_all_rooms item error: {e}")
+        if err == 0:
+            messagebox.showinfo("OK", "Minden szoba mentve.")
+            self.logger.log("Minden szoba mentve.")
+        else:
+            messagebox.showwarning("Figyelem", f"{err} szobánál hiba történt. Részletek a logban.")
+            self.logger.log(f"Minden szoba mentve, de {err} hibával.")
 
     def apply_num_rooms(self):
         try:
             n = int(self.num_rooms_var.get())
             if n < 1 or n > 50:
                 raise ValueError("1..50")
-        except Exception:
-            messagebox.showwarning("Figyelem", "Szobaszám legyen 1..50 közötti egész.")
-            return
-        self.fs.ensure_rooms_exist(n)
-        # rooms.json bővülhetett -> újraépítjük a listát
-        self.rebuild_room_rows()
-        messagebox.showinfo("OK", "Szobák frissítve a megadott számmal.")
+            self.fs.ensure_rooms_exist(n)
+            self.rebuild_room_rows()
+            self.logger.log(f"Szobák frissítve: {n}")
+            messagebox.showinfo("OK", "Szobák frissítve a megadott számmal.")
+        except Exception as e:
+            self.logger.log(f"apply_num_rooms error: {e}")
+            messagebox.showwarning("Figyelem", f"Szobaszám frissítés hiba:\n{e}")
 
     def periodic_refresh(self):
-        # szobák státuszainak frissítése
-        for rr in self.room_rows.values():
-            rr.refresh_from_files()
-        # összesített státuszból is lehetne aggregálni, de per-szoba elég
-        self.after(self.refresh_interval_ms, self.periodic_refresh)
+        try:
+            for rr in self.room_rows.values():
+                try:
+                    rr.refresh_from_files()
+                except Exception as e_row:
+                    self.logger.log(f"{rr.room_id}: periodic refresh error: {e_row}")
+            self.status_var.set(f"Frissítve: {iso_now()}")
+        except Exception as e:
+            # itt sem állunk le, csak logolunk
+            self.logger.log(f"periodic_refresh error: {e}")
+        finally:
+            # mindenképp újraütemezünk
+            self.after(self.refresh_interval_ms, self.periodic_refresh)
 
 # -------------------- Belépési pont --------------------
 
 if __name__ == "__main__":
-    app = SupervisorApp(base_dir="I:\\thermostat")
+    app = SupervisorApp(base_dir=DEFAULT_BASE_DIR)
     app.mainloop()

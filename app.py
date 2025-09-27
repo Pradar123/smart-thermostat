@@ -1,9 +1,6 @@
 # thermostat_controller.py
-# Windows-kompatibilis, zónás, textfájl-alapú, öntanuló termosztát váz Home Assistant / Node-RED integrációhoz.
-# - Mappák és fájlok automatikus létrehozása (failsafe)
-# - Hiszterézises vezérlés + overshoot (túlugrás) előrejelzés és tanulás kültéri hőmérséklet-sávok szerint
-# - Stabil, atomi fájlírások; JSON-konfigok és per-szoba státusz
-# - CLI: --rooms N, --loop-seconds S, --base-dir PATH
+# Windows-kompatibilis, zónás, textfájlos, öntanuló termosztát.
+# Stabilabb I/O: retry-olt atomi írás/olvasás, hibatűrő főciklus, log-rotáció.
 
 import os
 import sys
@@ -14,21 +11,32 @@ import threading
 from datetime import datetime
 from typing import Dict, Any, Optional, Tuple
 
-# ------------------------- Alapbeállítások (módosítható) -------------------------
+# ------------------------- Alapbeállítások -------------------------
 
 DEFAULT_NUM_ROOMS = 5
 DEFAULT_LOOP_SECONDS = 2.0
 DEFAULT_SETPOINT = 21.0
 DEFAULT_HYSTERESIS = 0.3        # °C
-DEFAULT_MIN_ON_SECONDS = 120     # min. bekapcsolva tartási idő (rövid ciklusok ellen)
-DEFAULT_MIN_OFF_SECONDS = 120    # min. kikapcsolva tartási idő
-DEFAULT_TAU_MIN = 5.0            # előrejelzéshez használt "lag" percben
-DEFAULT_SLOPE_EMA_WINDOW_S = 300 # EMA ablak a meredekséghez (~5 perc)
+DEFAULT_MIN_ON_SECONDS = 120
+DEFAULT_MIN_OFF_SECONDS = 120
+DEFAULT_TAU_MIN = 5.0
+DEFAULT_SLOPE_EMA_WINDOW_S = 300
 DEFAULT_OVERSHOOT_EMA_ALPHA = 0.2
 DEFAULT_EPS_TEMP = 0.01
 
+# Windows hálózati meghajtó alapértelmezés (nálad így használjuk)
+DEFAULT_BASE_DIR = r"I:\thermostat"
+
 OUTDOOR_BINS = [(-30, -10), (-10, 0), (0, 10), (10, 20), (20, 35), (35, 60)]
-# -------------------------------------------------------------------------------
+
+# I/O retry beállítások (Samba/Windows lockok ellen)
+IO_RETRIES = 5
+IO_DELAY_S = 0.2
+
+# Log rotáció
+MAX_LOG_BYTES = 2 * 1024 * 1024  # ~2 MB
+
+# -------------------------------------------------------------------
 
 def now_ts() -> float:
     return time.time()
@@ -39,10 +47,26 @@ def iso_now() -> str:
 def ensure_dir(path: str):
     os.makedirs(path, exist_ok=True)
 
+# ------------------------- Stabil I/O segédek -------------------------
+
+def _retry_io(fn, *args, **kwargs):
+    last_exc = None
+    for attempt in range(IO_RETRIES):
+        try:
+            return fn(*args, **kwargs)
+        except Exception as e:
+            last_exc = e
+            if attempt < IO_RETRIES - 1:
+                time.sleep(IO_DELAY_S)
+            else:
+                raise last_exc
+
 def safe_read_text(path: str) -> Optional[str]:
     try:
-        with open(path, "r", encoding="utf-8") as f:
-            return f.read().strip()
+        def _read():
+            with open(path, "r", encoding="utf-8") as f:
+                return f.read().strip()
+        return _retry_io(_read)
     except Exception:
         return None
 
@@ -63,22 +87,28 @@ def safe_read_str(path: str, default: str) -> str:
 
 def atomic_write_text(path: str, content: str):
     tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        f.write(content)
-    os.replace(tmp, path)
+    def _write_and_replace():
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(content)
+        os.replace(tmp, path)
+    _retry_io(_write_and_replace)
 
 def load_json(path: str, default: Any) -> Any:
     try:
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
+        def _load():
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        return _retry_io(_load)
     except Exception:
         return default
 
 def save_json_atomic(path: str, obj: Any):
     tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(obj, f, indent=2, ensure_ascii=False)
-    os.replace(tmp, path)
+    def _dump_and_replace():
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(obj, f, indent=2, ensure_ascii=False)
+        os.replace(tmp, path)
+    _retry_io(_dump_and_replace)
 
 def temp_to_bin_key(outdoor_temp: Optional[float]) -> str:
     if outdoor_temp is None:
@@ -91,20 +121,45 @@ def temp_to_bin_key(outdoor_temp: Optional[float]) -> str:
 def clamp(v: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, v))
 
+# ------------------------- Logger -------------------------
+
 class EventLogger:
     def __init__(self, log_path: str):
         self.log_path = log_path
         ensure_dir(os.path.dirname(log_path))
         self.lock = threading.Lock()
 
+    def _rotate_if_needed(self):
+        try:
+            if os.path.exists(self.log_path) and os.path.getsize(self.log_path) > MAX_LOG_BYTES:
+                bak = self.log_path + ".1"
+                try:
+                    if os.path.exists(bak):
+                        os.remove(bak)
+                except Exception:
+                    pass
+                try:
+                    os.replace(self.log_path, bak)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
     def log(self, msg: str):
         line = f"{iso_now()} | {msg}\n"
         try:
             with self.lock:
+                self._rotate_if_needed()
                 with open(self.log_path, "a", encoding="utf-8") as f:
                     f.write(line)
         except Exception:
-            pass
+            # végső fallback: stderr
+            try:
+                sys.stderr.write(line)
+            except Exception:
+                pass
+
+# ------------------------- Szobavezérlő -------------------------
 
 class RoomController:
     def __init__(self, base_dir: str, room_id: str, friendly_name: str, logger: EventLogger, learning_store: Dict[str, Any], config: Dict[str, Any]):
@@ -112,54 +167,58 @@ class RoomController:
         self.room_id = room_id
         self.friendly_name = friendly_name
         self.logger = logger
-        self.learning_store = learning_store  # shared dict, will be saved by main loop
+        self.learning_store = learning_store
         self.config = config
 
         # Paths
         self.room_dir = os.path.join(base_dir, "data", "rooms", room_id)
         ensure_dir(self.room_dir)
 
-        # Input files (Node-RED/HA tölti):
+        # Inputok
         self.p_temp = os.path.join(self.room_dir, "sensor_temperature.txt")
         self.p_hum  = os.path.join(self.room_dir, "sensor_humidity.txt")
         self.p_setp = os.path.join(self.room_dir, "setpoint.txt")
         self.p_hyst = os.path.join(self.room_dir, "hysteresis.txt")
 
-        # Output files (mi írjuk):
+        # Outputok
         self.p_cmd  = os.path.join(self.room_dir, "command_heat.txt")
         self.p_stat = os.path.join(self.room_dir, "status.json")
 
-        # Failsafe default file generation
         self._ensure_default_files()
 
-        # Runtime state
-        self.heating_cmd = 0  # 0/1 aktuális parancs (amit mi írunk)
+        # Runtime
+        self.heating_cmd = 0
         self.last_cmd = 0
         self.last_switch_ts: float = 0.0
         self.last_temp: Optional[float] = None
         self.last_ts: Optional[float] = None
-        self.ema_slope_on: Optional[float] = None   # °C/min
-        self.ema_slope_off: Optional[float] = None  # °C/min
+        self.ema_slope_on: Optional[float] = None
+        self.ema_slope_off: Optional[float] = None
 
-        # Overshoot mérés 1->0 váltások után
-        self.pending_ov: Optional[Dict[str, Any]] = None  # {'off_ts', 'temp_at_off', 'setpoint_at_off', 'peak_temp'}
+        # Overshoot mérés
+        self.pending_ov: Optional[Dict[str, Any]] = None
+
+        # hibaszámláló a státuszhoz
+        self.last_write_error: Optional[str] = None
 
     def _ensure_default_files(self):
-        if safe_read_text(self.p_temp) is None:
-            atomic_write_text(self.p_temp, f"{DEFAULT_SETPOINT:.2f}")  # kezdő temp = 21.0
-        if safe_read_text(self.p_hum) is None:
-            atomic_write_text(self.p_hum, "50.0")
-        if safe_read_text(self.p_setp) is None:
-            atomic_write_text(self.p_setp, f"{DEFAULT_SETPOINT:.2f}")
-        if safe_read_text(self.p_hyst) is None:
-            atomic_write_text(self.p_hyst, f"{DEFAULT_HYSTERESIS:.2f}")
-        if safe_read_text(self.p_cmd) is None:
-            atomic_write_text(self.p_cmd, "0")
-        if safe_read_text(self.p_stat) is None:
-            save_json_atomic(self.p_stat, {"init": True, "room_id": self.room_id, "name": self.friendly_name})
+        try:
+            if safe_read_text(self.p_temp) is None:
+                atomic_write_text(self.p_temp, f"{DEFAULT_SETPOINT:.2f}")
+            if safe_read_text(self.p_hum) is None:
+                atomic_write_text(self.p_hum, "50.0")
+            if safe_read_text(self.p_setp) is None:
+                atomic_write_text(self.p_setp, f"{DEFAULT_SETPOINT:.2f}")
+            if safe_read_text(self.p_hyst) is None:
+                atomic_write_text(self.p_hyst, f"{DEFAULT_HYSTERESIS:.2f}")
+            if safe_read_text(self.p_cmd) is None:
+                atomic_write_text(self.p_cmd, "0")
+            if load_json(self.p_stat, None) is None:
+                save_json_atomic(self.p_stat, {"init": True, "room_id": self.room_id, "name": self.friendly_name})
+        except Exception as e:
+            self.logger.log(f"{self.room_id}: default file ensure error: {e}")
 
     def _learning_node(self) -> Dict[str, Any]:
-        # learning_store struktúra: {'rooms': {room_id: {'bins': {key: {'overshoot': val, 'count': n}}, 'ema_slope_on': x, 'ema_slope_off': y}}}
         rooms = self.learning_store.setdefault("rooms", {})
         node = rooms.setdefault(self.room_id, {})
         node.setdefault("bins", {})
@@ -170,7 +229,6 @@ class RoomController:
         return node
 
     def _update_ema(self, current: Optional[float], new_val: float, dt_sec: float, window_s: float) -> float:
-        # Időalapú EMA: alpha = dt / (window + dt)
         alpha = dt_sec / (window_s + dt_sec)
         if current is None:
             return new_val
@@ -179,23 +237,27 @@ class RoomController:
     def _read_inputs(self) -> Tuple[float, float, float]:
         temp = safe_read_float(self.p_temp, DEFAULT_SETPOINT)
         hum = safe_read_float(self.p_hum, 50.0)
-        setp = safe_read_float(self.p_setp, DEFAULT_SETPOINT)
         hyst = safe_read_float(self.p_hyst, DEFAULT_HYSTERESIS)
-        # Hyst per file, de a hívóban elérhető a globális is, itt visszaadjuk külön:
         return temp, hum, max(0.0, hyst if hyst == hyst else DEFAULT_HYSTERESIS)
 
     def _write_outputs(self, status: Dict[str, Any]):
-        # command
-        atomic_write_text(self.p_cmd, "1" if self.heating_cmd == 1 else "0")
-        # status
-        status_out = {
-            "timestamp": iso_now(),
-            "room_id": self.room_id,
-            "name": self.friendly_name,
-            "heating_command": int(self.heating_cmd),
-            **status
-        }
-        save_json_atomic(self.p_stat, status_out)
+        try:
+            atomic_write_text(self.p_cmd, "1" if self.heating_cmd == 1 else "0")
+        except Exception as e:
+            self.logger.log(f"{self.room_id}: write command_heat error: {e}")
+        try:
+            status_out = {
+                "timestamp": iso_now(),
+                "room_id": self.room_id,
+                "name": self.friendly_name,
+                "heating_command": int(self.heating_cmd),
+                **status
+            }
+            save_json_atomic(self.p_stat, status_out)
+            self.last_write_error = None
+        except Exception as e:
+            self.last_write_error = str(e)
+            self.logger.log(f"{self.room_id}: write status.json error: {e}")
 
     def _overshoot_bin(self, key: str) -> Dict[str, Any]:
         node = self._learning_node()
@@ -208,7 +270,6 @@ class RoomController:
 
     def _update_overshoot_model(self, bin_key: str, observed_overshoot: float):
         b = self._overshoot_bin(bin_key)
-        # EMA-s jellegű frissítés
         if b["count"] == 0:
             b["overshoot"] = max(0.0, observed_overshoot)
         else:
@@ -220,21 +281,16 @@ class RoomController:
         b = self._overshoot_bin(bin_key)
         learned = b.get("overshoot", 0.0)
         ema_on = node.get("ema_slope_on", None)
-        # fallback komponens: aktuális melegedési meredekség * tau
         fallback = 0.0
         if ema_on is not None and ema_on > 0:
             fallback = ema_on * tau_min
-        # óvatos kombináció: a nagyobbikat vesszük (konzervatív, hogy inkább előbb kapcsoljunk ki)
         return max(learned, fallback)
 
     def _finalize_pending_overshoot_if_ready(self, current_temp: float, setpoint: float, dt_sec: float, outdoor_bin_key: str):
         if not self.pending_ov:
             return
-        # Feltétel: hőmérséklet csúcs már megvolt (t <= last_temp) vagy eltelt 15 perc, vagy újra bekapcsoltunk
-        # Ezt a függvényt csak OFF állapotban hívjuk (ON-ban reseteli az új ON), így itt csúcsfigyelést végzünk
         elapsed = now_ts() - self.pending_ov["off_ts"]
         peak = self.pending_ov["peak_temp"]
-        # Ha csökkenni kezd, vagy lejár 15 perc, lezárjuk
         closing = False
         if self.last_temp is not None and current_temp <= self.last_temp - DEFAULT_EPS_TEMP:
             closing = True
@@ -247,21 +303,18 @@ class RoomController:
             self.pending_ov = None
 
     def step(self, outdoor_temp: Optional[float], mode: str, tau_min: float, min_on_s: float, min_off_s: float, loop_seconds: float, global_hyst: float):
-        """
-        Egy vezérlési ciklus végrehajtása.
-        """
+        # Beolvasások
         temp, hum, room_hyst = self._read_inputs()
-        hyst = max(room_hyst, global_hyst)  # biztos ami biztos
+        hyst = max(room_hyst, global_hyst)
 
-        # Idők, deriváltak
         ts = now_ts()
         dt_sec = (ts - self.last_ts) if self.last_ts is not None else loop_seconds
         dt_sec = max(0.001, dt_sec)
+
         slope_per_min = None
         if self.last_temp is not None:
             slope_per_min = (temp - self.last_temp) / (dt_sec / 60.0)
 
-        # EMA frissítések
         node = self._learning_node()
         if slope_per_min is not None:
             if self.heating_cmd == 1:
@@ -271,49 +324,34 @@ class RoomController:
                 self.ema_slope_off = self._update_ema(self.ema_slope_off, slope_per_min, dt_sec, DEFAULT_SLOPE_EMA_WINDOW_S)
                 node["ema_slope_off"] = self.ema_slope_off
 
-        # Overshoot mérés kezelése OFF-ban
         bin_key = temp_to_bin_key(outdoor_temp)
-        if self.heating_cmd == 0:
-            if self.pending_ov:
-                # Frissítjük a lokális csúcsot
-                if temp > self.pending_ov["peak_temp"]:
-                    self.pending_ov["peak_temp"] = temp
-                self._finalize_pending_overshoot_if_ready(temp, DEFAULT_SETPOINT, dt_sec, bin_key)
+        if self.heating_cmd == 0 and self.pending_ov:
+            if temp > self.pending_ov["peak_temp"]:
+                self.pending_ov["peak_temp"] = temp
+            # a setpoint param itt nem használt, az OFF-kori setpointot tároljuk a pending_ov-ban
+            self._finalize_pending_overshoot_if_ready(temp, DEFAULT_SETPOINT, dt_sec, bin_key)
 
-        # Vezérlési logika
         prev_cmd = self.heating_cmd
         setpoint = safe_read_float(self.p_setp, DEFAULT_SETPOINT)
 
-        # Globális mód
         if mode.lower() == "off":
             self.heating_cmd = 0
         else:
-            # Anticipatív OFF: ha bekapcsolva vagyunk, előre kikapcsolunk, hogy a csúcs pont a setpoint körül legyen
             min_since_switch = (ts - self.last_switch_ts) / 60.0 if self.last_switch_ts > 0 else 1e9
-            # Min időzár figyelése:
             if self.heating_cmd == 1:
-                # Overshoot előrejelzés
                 pred_ov = self._predicted_overshoot(bin_key, tau_min)
-                off_trigger_temp = setpoint - pred_ov
-                # Hysterézissel óvatosan: ne kapcsolgasson gyorsan, ezért az off_trigger_temp-et ne húzzuk le nagyon a setpont alá
-                off_trigger_temp = min(off_trigger_temp, setpoint)  # sose legyen a setpont felett
-                # Minimális ON időkorlát:
+                off_trigger_temp = min(setpoint - pred_ov, setpoint)
                 if temp >= off_trigger_temp and min_since_switch * 60.0 >= min_on_s:
                     self.heating_cmd = 0
             else:
-                # Bekapcsolási feltétel (klasszikus hiszterézis)
                 if temp <= setpoint - hyst and min_since_switch * 60.0 >= min_off_s:
                     self.heating_cmd = 1
-
-            # Biztonsági OFF, ha túlmelegedne:
             if temp >= setpoint + hyst:
                 self.heating_cmd = 0
 
-        # Állapotváltás detektálás
         if prev_cmd != self.heating_cmd:
             self.last_switch_ts = ts
             if prev_cmd == 1 and self.heating_cmd == 0:
-                # OFF-ba váltottunk -> indul overshoot mérés
                 self.pending_ov = {
                     "off_ts": ts,
                     "temp_at_off": temp,
@@ -322,11 +360,9 @@ class RoomController:
                 }
                 self.logger.log(f"{self.room_id}: SWITCH OFF at {temp:.2f}°C (sp={setpoint:.2f}) bin={bin_key}")
             elif prev_cmd == 0 and self.heating_cmd == 1:
-                # ON-ba váltottunk -> korábbi mérés érvénytelen
                 self.pending_ov = None
                 self.logger.log(f"{self.room_id}: SWITCH ON at {temp:.2f}°C (sp={setpoint:.2f}) bin={bin_key}")
 
-        # Státusz kiírás
         status = {
             "temperature": round(temp, 3),
             "humidity": round(hum, 1),
@@ -338,13 +374,15 @@ class RoomController:
             "ema_slope_off_c_per_min": None if self.ema_slope_off is None else round(self.ema_slope_off, 4),
             "predicted_overshoot": round(self._predicted_overshoot(bin_key, tau_min), 3),
             "last_switch_iso": datetime.fromtimestamp(self.last_switch_ts).isoformat(timespec="seconds") if self.last_switch_ts > 0 else None,
+            "last_write_error": self.last_write_error
         }
         self._write_outputs(status)
 
-        # Következő körhöz
         self.last_temp = temp
         self.last_ts = ts
         self.last_cmd = prev_cmd
+
+# ------------------------- Fő app -------------------------
 
 class ThermostatApp:
     def __init__(self, base_dir: str, num_rooms: int, loop_seconds: float):
@@ -378,7 +416,7 @@ class ThermostatApp:
         self.rooms_map = self._ensure_rooms_map()
         self.learning = load_json(self.p_learning, {"rooms": {}})
 
-        # Szobák példányosítása
+        # Szobák
         self.rooms: Dict[str, RoomController] = {}
         for idx in range(1, self.num_rooms + 1):
             rid = f"room{idx}"
@@ -390,6 +428,8 @@ class ThermostatApp:
             atomic_write_text(self.p_outdoor_temp, "10.0")
         if safe_read_text(self.p_mode) is None:
             atomic_write_text(self.p_mode, "auto")
+
+        self.consecutive_errors = 0
 
     def _ensure_controller_cfg(self) -> Dict[str, Any]:
         cfg = load_json(self.p_controller_cfg, None)
@@ -403,7 +443,6 @@ class ThermostatApp:
                 "tau_minutes": DEFAULT_TAU_MIN
             }
             save_json_atomic(self.p_controller_cfg, cfg)
-        # CLI felülírhatja a számot és a loop időt
         cfg["num_rooms"] = self.num_rooms
         cfg["loop_seconds"] = self.loop_seconds
         return cfg
@@ -417,7 +456,6 @@ class ThermostatApp:
             m = {"rooms": rooms}
             save_json_atomic(self.p_rooms_map, m)
         else:
-            # egészítsük ki, ha kevesebb szoba van benne
             current_ids = {r["id"] for r in m.get("rooms", [])}
             changed = False
             for idx in range(1, self.num_rooms + 1):
@@ -436,11 +474,9 @@ class ThermostatApp:
         return room_id
 
     def _reload_room_names_if_changed(self):
-        # Lehetővé teszi a GUI/Node-RED átnevezést újraindítás nélkül (rooms.json módosításakor)
         m = load_json(self.p_rooms_map, None)
         if not m:
             return
-        # Ha változott, frissítjük a példányok friendly_name mezőjét
         for r in m.get("rooms", []):
             rid = r.get("id")
             if rid in self.rooms:
@@ -469,7 +505,10 @@ class ThermostatApp:
         for rid, rc in self.rooms.items():
             s = load_json(rc.p_stat, {})
             out["rooms"].append(s)
-        save_json_atomic(self.p_status_all, out)
+        try:
+            save_json_atomic(self.p_status_all, out)
+        except Exception as e:
+            self.logger.log(f"write status_all.json error: {e}")
 
     def run(self):
         loop_s = float(self.controller_cfg.get("loop_seconds", DEFAULT_LOOP_SECONDS))
@@ -478,55 +517,70 @@ class ThermostatApp:
         min_off_s = float(self.controller_cfg.get("min_off_seconds", DEFAULT_MIN_OFF_SECONDS))
         tau_min = float(self.controller_cfg.get("tau_minutes", DEFAULT_TAU_MIN))
 
-        self.logger.log(f"Controller started: rooms={self.num_rooms}, loop={loop_s}s, hyst={global_hyst}, tau={tau_min}min")
+        self.logger.log(f"Controller started: base_dir='{self.base_dir}', rooms={self.num_rooms}, loop={loop_s}s, hyst={global_hyst}, tau={tau_min}min")
         try:
             while True:
-                self._reload_room_names_if_changed()
+                try:
+                    self._reload_room_names_if_changed()
 
-                outdoor = self._read_outdoor_temp()
-                mode = self._read_mode()
+                    outdoor = self._read_outdoor_temp()
+                    mode = self._read_mode()
 
-                for rid, rc in self.rooms.items():
-                    # Engedélyezés ellenőrzés (ha valaki kikapcsolt egy szobát a rooms.json-ban)
-                    enabled = True
-                    for r in self.rooms_map.get("rooms", []):
-                        if r.get("id") == rid:
-                            enabled = bool(r.get("enabled", True))
-                            break
-                    if not enabled:
-                        # Szoba tiltva -> parancs 0 és státusz kiírás
-                        prev_cmd = rc.heating_cmd
-                        rc.heating_cmd = 0
-                        if prev_cmd != 0:
-                            rc.last_switch_ts = now_ts()
-                            rc.pending_ov = None
-                            self.logger.log(f"{rid}: DISABLED -> FORCE OFF")
-                        rc._write_outputs({
-                            "disabled": True,
-                            "note": "Room disabled via rooms.json"
-                        })
-                        continue
+                    for rid, rc in self.rooms.items():
+                        try:
+                            # enabled flag ellenőrzése
+                            enabled = True
+                            for r in self.rooms_map.get("rooms", []):
+                                if r.get("id") == rid:
+                                    enabled = bool(r.get("enabled", True))
+                                    break
+                            if not enabled:
+                                prev_cmd = rc.heating_cmd
+                                rc.heating_cmd = 0
+                                if prev_cmd != 0:
+                                    rc.last_switch_ts = now_ts()
+                                    rc.pending_ov = None
+                                    self.logger.log(f"{rid}: DISABLED -> FORCE OFF")
+                                rc._write_outputs({
+                                    "disabled": True,
+                                    "note": "Room disabled via rooms.json"
+                                })
+                                continue
 
-                    rc.step(outdoor, mode, tau_min, min_on_s, min_off_s, loop_s, global_hyst)
+                            rc.step(outdoor, mode, tau_min, min_on_s, min_off_s, loop_s, global_hyst)
+                        except Exception as e_room:
+                            self.logger.log(f"{rid}: step error: {e_room}")
 
-                # learning mentése és összesített státusz
-                save_json_atomic(self.p_learning, self.learning)
-                self._write_all_status(outdoor, mode)
+                    # learning + összesített státusz
+                    try:
+                        save_json_atomic(self.p_learning, self.learning)
+                    except Exception as e_learn:
+                        self.logger.log(f"learning.json save error: {e_learn}")
 
-                time.sleep(loop_s)
+                    self._write_all_status(outdoor, mode)
+
+                    self.consecutive_errors = 0
+                except Exception as e_loop:
+                    self.consecutive_errors += 1
+                    self.logger.log(f"LOOP ERROR ({self.consecutive_errors}): {e_loop}")
+                    # Nem állunk le; ha sok a hiba, kicsit nagyobb pihenő
+                    time.sleep(min(loop_s * (1 + self.consecutive_errors*0.5), 10.0))
+                finally:
+                    time.sleep(loop_s)
         except KeyboardInterrupt:
             self.logger.log("Controller stopped by user (KeyboardInterrupt)")
-            save_json_atomic(self.p_learning, self.learning)
-        except Exception as e:
-            self.logger.log(f"FATAL ERROR: {e}")
-            save_json_atomic(self.p_learning, self.learning)
-            raise
+            try:
+                save_json_atomic(self.p_learning, self.learning)
+            except Exception as e:
+                self.logger.log(f"on-exit learning save error: {e}")
+
+# ------------------------- CLI -------------------------
 
 def parse_args():
     ap = argparse.ArgumentParser(description="Zónás, textfájl-alapú, öntanuló termosztátváz (Home Assistant / Node-RED)")
     ap.add_argument("--rooms", type=int, default=DEFAULT_NUM_ROOMS, help="Szobák száma (room1..roomN)")
     ap.add_argument("--loop-seconds", type=float, default=DEFAULT_LOOP_SECONDS, help="Vezérlési ciklus másodpercben")
-    ap.add_argument("--base-dir", type=str, default="I:\\thermostat", help="Projekt gyökér mappa (alapértelmezés: aktuális könyvtár)")
+    ap.add_argument("--base-dir", type=str, default=DEFAULT_BASE_DIR, help="Projekt gyökér mappa (pl. hálózati meghajtó)")
     return ap.parse_args()
 
 def main():
