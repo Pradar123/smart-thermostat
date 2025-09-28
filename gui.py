@@ -239,6 +239,25 @@ class FS:
         cfg["num_rooms"] = int(num_rooms)
         save_json_atomic(self.p_controller_cfg, cfg)
 
+    # ---- Tanulási adatok törlése (szobánként) ----
+    def reset_learning_for_room(self, room_id: str) -> bool:
+        try:
+            data = load_json(self.p_learning, {"rooms": {}})
+            if "rooms" not in data or not isinstance(data["rooms"], dict):
+                data["rooms"] = {}
+            # alap szerkezet üresítve
+            data["rooms"][room_id] = {
+                "bins": {},
+                "ema_slope_on": None,
+                "ema_slope_off": None
+            }
+            save_json_atomic(self.p_learning, data)
+            self.logger.log(f"{room_id}: learning.json tanulási adatok törölve.")
+            return True
+        except Exception as e:
+            self.logger.log(f"{room_id}: learning reset hiba: {e}")
+            return False
+
 # -------------------- Szoba sor (UI komponens) --------------------
 
 class RoomRow(ttk.Frame):
@@ -286,6 +305,7 @@ class RoomRow(ttk.Frame):
 
         ttk.Button(self, text="Mentés", command=self.save_changes).grid(row=0, column=col, padx=4, pady=3); col += 1
         ttk.Button(self, text="Mappa", command=self.open_folder).grid(row=0, column=col, padx=4, pady=3); col += 1
+        ttk.Button(self, text="Reset tanulás", command=self.reset_learning).grid(row=0, column=col, padx=4, pady=3); col += 1
 
         # Hover tippek
         self.setp_entry.tooltip = CreateToolTip(self.setp_entry, "Célhőmérséklet (°C) – setpoint.txt")
@@ -395,6 +415,22 @@ class RoomRow(ttk.Frame):
         except Exception as e:
             self.fs.logger.log(f"{self.room_id}: hysteresis mentés hiba: {e}")
             messagebox.showwarning("Figyelem", f"{self.room_id}: Hysteresis formátum hibás.")
+
+    def reset_learning(self):
+        try:
+            if not messagebox.askyesno("Megerősítés",
+                                       f"Biztosan törlöd a tanulási adatokat ennél a szobánál?\n({self.room_id})"):
+                return
+            ok = self.fs.reset_learning_for_room(self.room_id)
+            if ok:
+                messagebox.showinfo("OK", f"{self.room_id}: tanulási adatok törölve.")
+                # felület frissítése (következő controller ciklusban az overshoot le fog esni)
+                self.refresh_from_files()
+            else:
+                messagebox.showerror("Hiba", f"{self.room_id}: tanulási adatok törlése sikertelen. Részletek a logban.")
+        except Exception as e:
+            self.fs.logger.log(f"{self.room_id}: reset_learning UI hiba: {e}")
+            messagebox.showerror("Hiba", f"{self.room_id}: reset_learning hiba:\n{e}")
 
 # Egyszerű tooltip segéd
 class CreateToolTip:
@@ -522,8 +558,9 @@ class SupervisorApp(tk.Tk):
 
         header = ttk.Frame(roomsf)
         header.pack(fill=tk.X, padx=2)
-        labels = ["ID", "Név", "Aktív", "T (°C)", "RH (%)", "Setpoint", "Hyster.", "Fűtés", "Overshoot", "Utolsó váltás", "", ""]
-        widths =  [8,   18,    6,      8,       8,        8,         8,        8,         10,             19,                6,  6]
+        # +1 oszlop a "Reset tanulás" gombnak
+        labels = ["ID", "Név", "Aktív", "T (°C)", "RH (%)", "Setpoint", "Hyster.", "Fűtés", "Overshoot", "Utolsó váltás", "", "", "Reset"]
+        widths =  [8,   18,    6,      8,       8,        8,         8,        8,         10,             19,                6,  6,   12]
         for i, (t, w) in enumerate(zip(labels, widths)):
             ttk.Label(header, text=t, width=w).grid(row=0, column=i, padx=4, pady=2, sticky="w")
 
