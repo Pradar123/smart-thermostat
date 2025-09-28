@@ -157,7 +157,7 @@ class FS:
 
         self.p_controller_cfg = os.path.join(self.config_dir, "controller_config.json")
         self.p_rooms_map = os.path.join(self.config_dir, "rooms.json")
-        self.p_learning = os.path.join(self.config_dir, "learning.json")
+        self.p_learning = os.path.join(self.config_dir, "learning.json")  # opcionális: lehet, hogy már nem használod
         self.p_outdoor_temp = os.path.join(self.external_dir, "outdoor_temperature.txt")
         self.p_mode = os.path.join(self.external_dir, "mode.txt")
         self.p_status_all = os.path.join(self.data_dir, "status_all.json")
@@ -173,8 +173,7 @@ class FS:
             atomic_write_text(self.p_outdoor_temp, "10.0")
         if safe_read_text(self.p_mode) is None:
             atomic_write_text(self.p_mode, "auto")
-        if load_json(self.p_learning, None) is None:
-            save_json_atomic(self.p_learning, {"rooms": {}})
+        # learning.json lehet, hogy nincs: ne erőltessük – ha van, olvassuk majd resetnél
 
         # per-room failsafe az aktuális num_rooms szerint
         cfg = load_json(self.p_controller_cfg, {})
@@ -239,20 +238,49 @@ class FS:
         cfg["num_rooms"] = int(num_rooms)
         save_json_atomic(self.p_controller_cfg, cfg)
 
-    # ---- Tanulási adatok törlése (szobánként) ----
+    # ---- Szobánkénti tanulási log elérési útja ----
+    def learn_log_path(self, room_id: str) -> str:
+        return os.path.join(self.rooms_root, room_id, f"{room_id}-learn.txt")
+
+    # ---- Tanulási adatok törlése (szobánként): log archiválása + (ha van) learning.json szoba-nód nullázása ----
     def reset_learning_for_room(self, room_id: str) -> bool:
         try:
-            data = load_json(self.p_learning, {"rooms": {}})
-            if "rooms" not in data or not isinstance(data["rooms"], dict):
-                data["rooms"] = {}
-            # alap szerkezet üresítve
-            data["rooms"][room_id] = {
-                "bins": {},
-                "ema_slope_on": None,
-                "ema_slope_off": None
-            }
-            save_json_atomic(self.p_learning, data)
-            self.logger.log(f"{room_id}: learning.json tanulási adatok törölve.")
+            # 1) roomX-learn.txt archiválása
+            p_log = self.learn_log_path(room_id)
+            if os.path.exists(p_log):
+                ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                bak = p_log + f".bak_{ts}"
+                try:
+                    os.replace(p_log, bak)
+                except Exception:
+                    # ha nem megy a rename, próbáljuk törölni
+                    try:
+                        os.remove(p_log)
+                    except Exception:
+                        pass
+                self.logger.log(f"{room_id}: tanulási log archiválva: {os.path.basename(bak)}")
+            # 2) új üres log fejléc-sorral
+            try:
+                header = (
+                    f"# {room_id}-learn.txt reset at {iso_now()}\n"
+                    "# Ezt a fájlt a controller írja: ON/OFF szakaszok és overshootok naplózása.\n"
+                )
+                atomic_write_text(p_log, header)
+            except Exception as e:
+                self.logger.log(f"{room_id}: új learn log létrehozási hiba: {e}")
+
+            # 3) (opcionális) config/learning.json adott szoba nullázása, ha a fájl létezik
+            if os.path.exists(self.p_learning):
+                data = load_json(self.p_learning, {"rooms": {}})
+                if "rooms" not in data or not isinstance(data["rooms"], dict):
+                    data["rooms"] = {}
+                data["rooms"][room_id] = {
+                    "bins": {},
+                    "ema_slope_on": None,
+                    "ema_slope_off": None
+                }
+                save_json_atomic(self.p_learning, data)
+                self.logger.log(f"{room_id}: learning.json tanulási adatok törölve.")
             return True
         except Exception as e:
             self.logger.log(f"{room_id}: learning reset hiba: {e}")
@@ -305,6 +333,7 @@ class RoomRow(ttk.Frame):
 
         ttk.Button(self, text="Mentés", command=self.save_changes).grid(row=0, column=col, padx=4, pady=3); col += 1
         ttk.Button(self, text="Mappa", command=self.open_folder).grid(row=0, column=col, padx=4, pady=3); col += 1
+        ttk.Button(self, text="Tanulás log", command=self.open_learning_log).grid(row=0, column=col, padx=4, pady=3); col += 1
         ttk.Button(self, text="Reset tanulás", command=self.reset_learning).grid(row=0, column=col, padx=4, pady=3); col += 1
 
         # Hover tippek
@@ -319,6 +348,23 @@ class RoomRow(ttk.Frame):
             os.startfile(rdir)  # Windows
         except Exception:
             messagebox.showerror("Hiba", f"Nem sikerült megnyitni: {rdir}")
+
+    def open_learning_log(self):
+        p = self.fs.learn_log_path(self.room_id)
+        # ha nem létezik, hozzunk létre üres fejlécet
+        if not os.path.exists(p):
+            try:
+                header = (
+                    f"# {self.room_id}-learn.txt created by GUI at {iso_now()}\n"
+                    "# A controller ide fog írni: ON/OFF szakaszok és overshoot megfigyelések.\n"
+                )
+                atomic_write_text(p, header)
+            except Exception as e:
+                self.fs.logger.log(f"{self.room_id}: learn log létrehozási hiba: {e}")
+        try:
+            os.startfile(p)  # Windows
+        except Exception:
+            messagebox.showerror("Hiba", f"Nem sikerült megnyitni: {p}")
 
     def update_status_colors(self):
         txt = (self.cmd_var.get() or "").upper()
@@ -419,15 +465,15 @@ class RoomRow(ttk.Frame):
     def reset_learning(self):
         try:
             if not messagebox.askyesno("Megerősítés",
-                                       f"Biztosan törlöd a tanulási adatokat ennél a szobánál?\n({self.room_id})"):
+                                       f"Biztosan törlöd/üríted a tanulási logot ennél a szobánál?\n({self.room_id})\n"
+                                       f"A jelenlegi log archiválásra kerül."):
                 return
             ok = self.fs.reset_learning_for_room(self.room_id)
             if ok:
-                messagebox.showinfo("OK", f"{self.room_id}: tanulási adatok törölve.")
-                # felület frissítése (következő controller ciklusban az overshoot le fog esni)
+                messagebox.showinfo("OK", f"{self.room_id}: tanulási log/értékek törölve (archiválva).")
                 self.refresh_from_files()
             else:
-                messagebox.showerror("Hiba", f"{self.room_id}: tanulási adatok törlése sikertelen. Részletek a logban.")
+                messagebox.showerror("Hiba", f"{self.room_id}: tanulási reset sikertelen. Részletek a logban.")
         except Exception as e:
             self.fs.logger.log(f"{self.room_id}: reset_learning UI hiba: {e}")
             messagebox.showerror("Hiba", f"{self.room_id}: reset_learning hiba:\n{e}")
@@ -470,8 +516,8 @@ class SupervisorApp(tk.Tk):
     def __init__(self, base_dir: str):
         super().__init__()
         self.title("Thermostat Supervisor")
-        self.geometry("1280x720")
-        self.minsize(1100, 600)
+        self.geometry("1280x780")
+        self.minsize(1100, 640)
 
         # Alap stílus
         try:
@@ -558,9 +604,9 @@ class SupervisorApp(tk.Tk):
 
         header = ttk.Frame(roomsf)
         header.pack(fill=tk.X, padx=2)
-        # +1 oszlop a "Reset tanulás" gombnak
-        labels = ["ID", "Név", "Aktív", "T (°C)", "RH (%)", "Setpoint", "Hyster.", "Fűtés", "Overshoot", "Utolsó váltás", "", "", "Reset"]
-        widths =  [8,   18,    6,      8,       8,        8,         8,        8,         10,             19,                6,  6,   12]
+        # +2 oszlop: "Tanulás log" + "Reset tanulás"
+        labels = ["ID", "Név", "Aktív", "T (°C)", "RH (%)", "Setpoint", "Hyster.", "Fűtés", "Overshoot", "Utolsó váltás", "", "Mappa", "Log", "Reset"]
+        widths =  [8,   18,    6,      8,       8,        8,         8,        8,         10,             19,                8,   8,      10,   10]
         for i, (t, w) in enumerate(zip(labels, widths)):
             ttk.Label(header, text=t, width=w).grid(row=0, column=i, padx=4, pady=2, sticky="w")
 
